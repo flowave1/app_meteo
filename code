@@ -1,2 +1,328 @@
-# code 
-a definir
+
+# =========================================
+# Portefeuille Excel (B4:AF40) -> Optimisation MPT robuste (xbbg)
+# - "LA" (ex: GRID LA) : close intraday à 17:40 Europe/Paris via bdib
+# - autres : PX_LAST quotidien
+# - Lags: FUND (VL J+1), US (>17:40 Paris)
+# - Log-returns, mu & Sigma annualisés
+# - Opti long-only (sum<=1) à vol cible EXACTE
+# =========================================
+
+from xbbg import blp
+import pandas as pd
+import numpy as np
+import math
+from datetime import date, time
+import warnings
+
+# ---------- PARAMÈTRES ----------
+EXCEL_PATH   = r"C:\Users\xxx\Desktop\Portefeuille.xlsx"   # <-- mets ton chemin
+SHEET_NAME   = 0
+RANGE_COLS   = "B:AF"      # B4:AF40
+HEADER_ROW   = 3           # (0-index) => ligne 4 = en-têtes
+NROWS        = 37          # 40 - 3
+COL_TICKER   = "Ticker"    # colonnes attendues dans la ligne 4
+COL_WEIGHT   = "Poids"
+
+START_DATE   = "2018-01-01"                     # ajuste au besoin
+END_DATE     = date.today().strftime("%Y-%m-%d")
+TRADING_DAYS = 252
+USE_LOG_RET  = True
+VOL_CIBLE    = 0.10                              # ex: 10%
+MIN_DAYS     = 252 * 1                           # lookback minimal (~1 an)
+DROP_THRESH  = 0.20                              # drop colonnes avec >20% NaN avant coupe
+
+# Règles de lag (pour éviter look-ahead)
+LAG_FUNDS    = 1                                  # VL J+1
+LAG_US       = 1                                  # actifs US (>17:40 Paris)
+
+# "LA" -> close intraday à 17:40
+TZ_PARIS     = 'Europe/Paris'
+TARGET_TIME  = time(17, 40)
+BDIB_INTERVAL_MIN = 1                             # 1 minute (mettre 5 si trop lourd)
+
+# ---------- 0) Lecture du portefeuille Excel ----------
+df = pd.read_excel(
+    EXCEL_PATH,
+    sheet_name=SHEET_NAME,
+    usecols=RANGE_COLS,
+    skiprows=HEADER_ROW,
+    nrows=NROWS
+)
+if COL_TICKER not in df.columns or COL_WEIGHT not in df.columns:
+    raise ValueError("Colonnes attendues introuvables en B4:AF40 : 'Ticker' et 'Poids'.")
+
+df = df[[COL_TICKER, COL_WEIGHT]].dropna()
+df[COL_TICKER] = df[COL_TICKER].astype(str).str.strip()
+
+w_raw = pd.to_numeric(df[COL_WEIGHT], errors="coerce").fillna(0.0).values
+w = w_raw / 100.0 if (w_raw > 1.0).any() else w_raw.copy()
+
+sumw = w.sum()
+if sumw > 1.0 + 1e-8:
+    warnings.warn(f"Somme des poids={sumw:.4f} > 1. Normalisation à 1.")
+    w = w / sumw
+
+tickers = df[COL_TICKER].tolist()
+if not tickers:
+    raise ValueError("Aucun ticker valide lu dans B4:AF40.")
+
+# ---------- 1) Métadonnées pour lags & détection FUND/US ----------
+meta = blp.bdp(
+    tickers=tickers,
+    flds=["SECURITY_TYP", "SECURITY_TYP2", "EQY_PRIM_EXCH", "CRNCY"],
+)
+
+def safe_meta(tk, fld, default=""):
+    try:
+        return meta.loc[tk, fld]
+    except Exception:
+        return default
+
+# FUND ?
+is_fund = (meta["SECURITY_TYP"].fillna("").str.contains("FUND", case=False)) | \
+          (meta["SECURITY_TYP2"].fillna("").str.contains("FUND", case=False))
+is_fund = is_fund.reindex(tickers).fillna(False)
+
+# US ?
+is_us = meta["EQY_PRIM_EXCH"].fillna("").str.upper().isin(["NYSE", "NASDAQ", "ARCA"]) | \
+        meta["CRNCY"].fillna("").str.upper().eq("USD")
+is_us = is_us.reindex(tickers).fillna(False)
+
+# LAG par ticker (J+1 pour FUND et/ou US)
+lag_days = pd.Series(0, index=tickers, dtype=int)
+lag_days[is_fund] = LAG_FUNDS
+lag_days[is_us] = np.maximum(lag_days[is_us], LAG_US)
+
+# ---------- 2) Détection "LA" (close 17:40 Paris) ----------
+# " LA" comme mot entier (ex: 'GRID LA')
+is_LA = pd.Series(tickers).str.contains(r'\bLA\b', case=False, regex=True)
+tickers_LA   = list(pd.Series(tickers)[is_LA.values])
+tickers_rest = list(pd.Series(tickers)[~is_LA.values])
+
+print(f"[Info] Tickers LA (close 17:40 Paris): {tickers_LA}")
+print(f"[Info] Tickers non-LA (PX_LAST)     : {tickers_rest}")
+
+# ---------- 3) Téléchargement des prix ----------
+# 3.1 Non-LA : PX_LAST quotidien
+prices_rest = pd.DataFrame()
+if len(tickers_rest) > 0:
+    prices_rest = blp.bdh(
+        tickers=tickers_rest,
+        flds='PX_LAST',
+        start_date=START_DATE,
+        end_date=END_DATE,
+        Per='D',
+        Fill='P'
+    )
+
+# 3.2 LA : close intraday à 17:40 Paris
+def daily_1740_series(ticker: str, start: str, end: str, tz: str = TZ_PARIS) -> pd.Series:
+    """
+    Série quotidienne du 'close' intraday à 17:40 Europe/Paris.
+    Si pas de barre exactement à 17:40, prend la dernière barre <= 17:40 du jour.
+    """
+    bars = blp.bdib(ticker=ticker, start=start, end=end, interval=BDIB_INTERVAL_MIN, tz=tz)
+    if bars is None or bars.empty:
+        return pd.Series(name=ticker, dtype=float)
+    bars = bars.copy()
+    # colonnes: ['ticker','time','open','high','low','close','volume']
+    bars['time'] = pd.to_datetime(bars['time'])
+    try:
+        bars['time'] = bars['time'].dt.tz_convert(tz)
+    except Exception:
+        # si déjà dans le bon tz
+        pass
+    bars['date'] = bars['time'].dt.date
+    # conserver barres <= 17:40
+    bars = bars[bars['time'].dt.time <= TARGET_TIME]
+    if bars.empty:
+        return pd.Series(name=ticker, dtype=float)
+    s = (bars.sort_values('time')
+              .groupby('date')['close']
+              .last())
+    s.index = pd.to_datetime(s.index)   # index = date
+    s.name = ticker
+    return s
+
+prices_la = pd.DataFrame()
+if len(tickers_LA) > 0:
+    la_series = []
+    for tk in tickers_LA:
+        s1740 = daily_1740_series(tk, START_DATE, END_DATE, tz=TZ_PARIS)
+        la_series.append(s1740)
+    if la_series:
+        prices_la = pd.concat(la_series, axis=1)
+
+# 3.3 Fusion
+if prices_rest.empty and prices_la.empty:
+    raise ValueError("Aucune donnée de prix récupérée. Vérifie tickers/dates/droits.")
+
+prices = pd.concat([prices_rest, prices_la], axis=1)
+prices = prices.sort_index().dropna(how='all')
+
+# Sélectionner uniquement nos tickers (ordre d'origine)
+missing = [tk for tk in tickers if tk not in prices.columns]
+if missing:
+    warnings.warn(f"Séries indisponibles: {missing}")
+present = [tk for tk in tickers if tk in prices.columns]
+prices = prices[present]
+
+# Nettoyage colonnes trop vides (avant lags)
+nan_ratio = prices.isna().mean()
+keep_cols = nan_ratio[nan_ratio <= DROP_THRESH].index.tolist()
+if len(keep_cols) == 0:
+    raise ValueError("Toutes les séries sont trop incomplètes (DROP_THRESH trop bas ?).")
+prices = prices[keep_cols].dropna(how='any')
+
+# Réconcilier poids/liste
+mask_keep = df[COL_TICKER].isin(prices.columns).values
+if mask_keep.sum() < len(w):
+    warnings.warn("Tickers supprimés (données insuffisantes): "
+                  + ", ".join(df.loc[~mask_keep, COL_TICKER].tolist()))
+w = w[mask_keep]
+df = df[mask_keep].reset_index(drop=True)
+tickers = df[COL_TICKER].tolist()
+
+# ---------- 4) Rendements + Lags (FUND & US) ----------
+if USE_LOG_RET:
+    rets = np.log(prices).diff()
+else:
+    rets = prices.pct_change(fill_method=None)
+# applique le lag par ticker
+for tk in tickers:
+    L = int(lag_days.get(tk, 0))
+    if L > 0:
+        rets[tk] = rets[tk].shift(L)
+
+# ---------- 5) Fenêtre robuste ----------
+rets = rets.dropna(how='all')
+# impose un lookback minimal par colonne
+valid = rets.notna().sum()
+keep_cols2 = valid[valid >= MIN_DAYS].index.tolist()
+if len(keep_cols2) == 0:
+    raise ValueError(f"Aucune série ne passe MIN_DAYS={MIN_DAYS}. Diminue le seuil.")
+rets = rets[keep_cols2]
+
+# synchroniser tickers/poids
+mask_keep2 = df[COL_TICKER].isin(keep_cols2).values
+if mask_keep2.sum() < len(w):
+    warnings.warn("Tickers supprimés (< lookback minimal): "
+                  + ", ".join(df.loc[~mask_keep2, COL_TICKER].tolist()))
+w = w[mask_keep2]
+df = df[mask_keep2].reset_index(drop=True)
+tickers = df[COL_TICKER].tolist()
+
+# intersection stricte des dates (évite Sigma non-PSD par paires)
+rets = rets.dropna(how='any')
+if len(rets) < MIN_DAYS:
+    warnings.warn(f"Fenêtre finale = {len(rets)} jours (MIN_DAYS={MIN_DAYS}).")
+
+# ---------- 6) μ & Σ annualisés ----------
+TR = TRADING_DAYS
+mu_daily = rets.mean()
+cov_daily = rets.cov()
+
+if USE_LOG_RET:
+    mu_ann = np.exp(mu_daily * TR) - 1.0
+else:
+    mu_ann = mu_daily * TR
+
+Sigma = cov_daily * TR
+mu_vec = mu_ann.reindex(tickers).values.astype(float)
+SigmaM = Sigma.reindex(index=tickers, columns=tickers).values
+
+# (Optionnel) Shrinkage ou EWMA ici si voulu.
+
+# ---------- 7) Stats portefeuille ACTUEL ----------
+w = w.astype(float)
+sumw = w.sum()
+cash = max(0.0, 1.0 - sumw)
+vol_port = float(math.sqrt(w @ (SigmaM @ w)))
+er_port  = float(w @ mu_vec)
+
+print("\n=== Portefeuille ACTUEL (après règles LA & lags) ===")
+print(f"Nb actifs: {len(tickers)} | Somme w={sumw:.4f} | Cash={cash:.4f}")
+print(f"Vol ann. = {vol_port:.4f} | ER ann. = {er_port*100:.2f}%")
+
+# Contributions au risque (MRC/CRC)
+if vol_port > 1e-12:
+    mrc = (SigmaM @ w) / vol_port
+    crc = w * mrc
+else:
+    mrc = np.zeros_like(w); crc = np.zeros_like(w)
+
+rc = pd.DataFrame({
+    "Ticker": tickers, "Poids": w, "MRC": mrc, "CRC": crc, "Mu_ann": mu_vec
+}).sort_values("CRC", ascending=False)
+print("\n--- CRC (contributions au risque) ---")
+print(rc.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
+
+# ---------- 8) Recalage à VOL_CIBLE (même mix) ----------
+scaled = False
+if vol_port > 1e-12 and abs(vol_port - VOL_CIBLE) > 1e-6:
+    s = VOL_CIBLE / vol_port
+    if s <= 1.0 + 1e-12:
+        w_scaled = w * s
+        cash_scaled = 1.0 - w_scaled.sum()
+        er_scaled = float(w_scaled @ mu_vec)
+        print("\n=== Recalage (même mix) à vol cible ===")
+        print(f"s = {s:.4f} | Vol (check) = {VOL_CIBLE:.4f}")
+        print(f"Poids risqués = {w_scaled.sum():.4f} | Cash = {cash_scaled:.4f} | ER = {er_scaled*100:.2f}%")
+        scaled = True
+    else:
+        print("\n[Info] Vol trop basse vs cible : il faudrait du levier (s>1).")
+
+# ---------- 9) Optimisation long-only (vol cible EXACTE) ----------
+print("\n=== Optimisation long-only (vol cible exacte) ===")
+opt_ok = False
+try:
+    import cvxpy as cp
+    x = cp.Variable(len(tickers), nonneg=True)
+    constraints = [cp.sum(x) <= 1.0, cp.quad_form(x, SigmaM) == VOL_CIBLE**2]
+    prob = cp.Problem(cp.Maximize(mu_vec @ x), constraints)
+    prob.solve(solver=cp.ECOS, verbose=False)
+    w_opt = np.maximum(np.array(x.value).ravel(), 0.0)
+    if w_opt.sum() > 1.0:
+        w_opt = w_opt / w_opt.sum()
+    cash_opt = max(0.0, 1.0 - w_opt.sum())
+    vol_opt = float(math.sqrt(w_opt @ (SigmaM @ w_opt)))
+    er_opt  = float(w_opt @ mu_vec)
+    opt_ok = True
+except Exception as e:
+    warnings.warn(f"cvxpy indisponible/échoué ({e}). Fallback heuristique.")
+    # fallback simple
+    w_opt = np.ones(len(tickers)) / len(tickers)
+    for _ in range(6000):
+        w_opt += 0.05 * mu_vec
+        w_opt = np.maximum(w_opt, 0.0)
+        ssum = w_opt.sum()
+        if ssum > 1.0: w_opt /= ssum
+        v = float(math.sqrt(w_opt @ (SigmaM @ w_opt)))
+        if v > 1e-12: w_opt *= (VOL_CIBLE / v)
+        if w_opt.sum() > 1.0: w_opt /= w_opt.sum()
+    cash_opt = max(0.0, 1.0 - w_opt.sum())
+    vol_opt = float(math.sqrt(w_opt @ (SigmaM @ w_opt)))
+    er_opt  = float(w_opt @ mu_vec)
+
+res = pd.DataFrame({"Ticker": tickers, "Poids_opt": w_opt, "Mu_ann": mu_vec})\
+        .sort_values("Poids_opt", ascending=False)
+print("\n--- Poids OPTIMAUX (triés) ---")
+print(res.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
+print(f"\nCash_opt = {cash_opt:.4f} | Vol_opt = {vol_opt:.4f} (cible {VOL_CIBLE:.4f}) | ER_opt = {er_opt*100:.2f}%")
+
+# Vérif e/Δ (sur actifs non nuls)
+if vol_opt > 1e-12:
+    mrc_opt = (SigmaM @ w_opt) / vol_opt
+    ratio = np.divide(mu_vec, mrc_opt, out=np.full_like(mu_vec, np.nan), where=(mrc_opt!=0))
+    chk = pd.DataFrame({"Ticker": tickers, "e/Δ": ratio, "w*": w_opt})\
+            .sort_values("w*", ascending=False)
+    print("\n--- Vérif e/Δ (actifs w*>0) ---")
+    print(chk.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
+
+# ---------- 10) Récap ----------
+print("\n=== RÉCAP ===")
+print(f"- Portefeuille Excel : Vol={vol_port:.4f}, ER={er_port*100:.2f}%, Somme_w={sumw:.4f}, Cash={cash:.4f}")
+if scaled:
+    print(f"- Même mix recalé   : Vol={VOL_CIBLE:.4f}, ER={er_scaled*100:.2f}%, Cash={cash_scaled:.4f}")
+print(f"- Optimisé (vol cible): Vol={vol_opt:.4f}, ER={er_opt*100:.2f}%, Cash={cash_opt:.4f}")
